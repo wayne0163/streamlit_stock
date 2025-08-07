@@ -16,6 +16,7 @@ from backtest.engine import run_backtest
 from risk.analyzer import RiskAnalyzer
 from config.settings import get_settings
 from utils.code_processor import to_ts_code
+from analysis.market_comparison import compare_indices
 
 # --- App Initialization ---
 st.set_page_config(page_title="WaySsystem - 量化交易管理系统", page_icon="📈", layout="wide")
@@ -205,7 +206,7 @@ def render_watchlist_editor(item_type='stock'):
 
 # --- Sidebar Navigation ---
 st.sidebar.title("导航")
-menu = ["数据管理", "自选列表管理", "资产管理", "选股策略", "回测引擎", "风险分析", "系统说明与操作指南"]
+menu = ["数据管理", "自选列表管理", "资产管理", "选股策略", "行业指数对比", "回测引擎", "风险分析", "系统说明与操作指南"]
 choice = st.sidebar.selectbox("功能导航", menu, key="main_menu")
 
 display_status()
@@ -336,6 +337,63 @@ elif choice == "选股策略":
                 st.dataframe(pd.DataFrame(results))
             else:
                 st.info("根据最新数据，您的自选股中没有找到符合该策略条件的股票。" )
+
+elif choice == "行业指数对比":
+    st.header("行业指数对比分析")
+    st.info("本功能用于分析特定行业指数相对于市场基准指数的强弱走势。")
+
+    # 获取所有自选指数用于选择
+    available_indices = db.fetch_all("SELECT ts_code, name FROM index_watchlist ORDER BY ts_code")
+    if not available_indices:
+        st.warning("您的自选指数列表为空。请先在“自选列表管理”页面添加指数（如 000985.CSI 和 857372.SI）并更新其数据。")
+        st.stop()
+
+    index_options = {f"{i['name']} ({i['ts_code']})": i['ts_code'] for i in available_indices}
+    
+    # 查找默认选项的索引
+    try:
+        default_base_index = list(index_options.values()).index('000985.CSI')
+    except ValueError:
+        default_base_index = 0
+    try:
+        default_industry_index = list(index_options.values()).index('857372.SI')
+    except ValueError:
+        default_industry_index = 1 if len(index_options) > 1 else 0
+
+
+    col1, col2 = st.columns(2)
+    with col1:
+        base_selection = st.selectbox("选择基准指数 (如 全A指数)", options=index_options.keys(), index=default_base_index)
+        base_index_code = index_options[base_selection]
+    with col2:
+        industry_selection = st.selectbox("选择对比行业指数", options=index_options.keys(), index=default_industry_index)
+        industry_index_code = index_options[industry_selection]
+
+    date_range = st.date_input("选择分析时间周期", [date(2024, 1, 1), date.today()], key="comparison_date_range")
+
+    if st.button("开始分析", type="primary"):
+        if not date_range or len(date_range) != 2:
+            st.error("请选择一个有效的日期范围。")
+        elif base_index_code == industry_index_code:
+            st.error("基准指数和行业指数不能相同。")
+        else:
+            start_str, end_str = date_range[0].strftime('%Y%m%d'), date_range[1].strftime('%Y%m%d')
+            with st.spinner(f"正在计算 {industry_selection} 相对于 {base_selection} 的强度..."):
+                result_df = compare_indices(db, base_index_code, industry_index_code, start_str, end_str)
+                
+                if result_df is not None and not result_df.empty:
+                    st.success("分析完成！")
+                    
+                    # 绘制图表
+                    fig = px.line(result_df, x='date', y=['ratio_c', 'c_ma10', 'c_ma20', 'c_ma60'],
+                                  title=f'{industry_selection} vs {base_selection} 相对强度比率',
+                                  labels={'value': '比率', 'date': '日期', 'variable': '指标'})
+                    fig.update_layout(legend_title_text='指标图例')
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    st.dataframe(result_df)
+                else:
+                    st.error("分析失败。可能的原因是：在选定时间段内，一个或两个指数缺少数据，或者数据无法对齐。请检查您的数据。")
 
 elif choice == "回测引擎":
     st.header("回测引擎")
