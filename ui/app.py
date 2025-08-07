@@ -380,7 +380,7 @@ elif choice == "回测引擎":
                     cols[0].metric("策略总收益率", f"{metrics.get('total_return', 0):.2f}%")
                     cols[1].metric("策略年化收益率", f"{metrics.get('annual_return', 0):.2f}%")
                     cols[2].metric("最大回撤", f"{metrics.get('max_drawdown', 0):.2f}%")
-                    cols[3].metric("夏普比率", f"{metrics.get('sharpe_ratio', 0):.2f}")
+                    cols[3].metric("夏普比率", f"{metrics.get('sharpe_ratio') or 0:.2f}")
                     
                     st.subheader("回测图表")
                     st.plotly_chart(result['plot_figure'], use_container_width=True)

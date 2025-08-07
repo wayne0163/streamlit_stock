@@ -115,11 +115,20 @@ def run_backtest(strategy_name: str, ts_codes: List[str], start_date: str, end_d
     metrics = {
         'total_return': thestrat.analyzers.returns.get_analysis().get('rtot', 0) * 100,
         'annual_return': thestrat.analyzers.returns.get_analysis().get('rann', 0) * 100,
-        'sharpe_ratio': thestrat.analyzers.sharpe_ratio.get_analysis().get('sharperatio', 0),
+        'sharpe_ratio': 0,
         'max_drawdown': thestrat.analyzers.drawdown.get_analysis().get('max', {}).get('drawdown', 0),
         'total_trades': trade_analysis.get('total', {}).get('total', 0),
-        'win_rate': (trade_analysis.get('won', {}).get('total', 0) / trade_analysis.get('total', {}).get('total', 1)) * 100
+        'win_rate': 0,
     }
+    
+    # 安全获取夏普比率
+    sharpe_analysis = thestrat.analyzers.sharpe_ratio.get_analysis()
+    if sharpe_analysis is not None:
+        metrics['sharpe_ratio'] = sharpe_analysis.get('sharperatio', 0)
+    
+    total_trades = trade_analysis.get('total', {}).get('total', 0)
+    if total_trades > 0:
+        metrics['win_rate'] = (trade_analysis.get('won', {}).get('total', 0) / total_trades) * 100
 
     plot_figure = create_backtest_plot(results, ts_codes, strategy_name)
 
