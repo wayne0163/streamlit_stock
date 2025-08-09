@@ -50,24 +50,8 @@ def compare_indices(db: Database, base_index_code: str, industry_index_code: str
         print("指数数据日期无法对齐。")
         return None
 
-    # 4. 找到基准日和基准价格
-    benchmark_day = df_merged.index[0]
-    a0 = df_merged['close_base'].iloc[0]
-    b0 = df_merged['close_industry'].iloc[0]
-
-    if a0 == 0 or b0 == 0:
-        print("基准日价格为0，无法计算。")
-        return None
-
-    # 5. 计算相对强度比率 C
-    df_merged['relative_base'] = df_merged['close_base'] / a0
-    df_merged['relative_industry'] = df_merged['close_industry'] / b0
-    
-    # 避免除以零
-    df_merged['ratio_c'] = df_merged.apply(
-        lambda row: (row['relative_industry'] / row['relative_base']) if row['relative_base'] != 0 else 0, 
-        axis=1
-    )
+    # 4. 直接计算收盘价比值 (行业指数 / 基准指数)
+    df_merged['ratio_c'] = df_merged['close_industry'] / df_merged['close_base']
 
     # 6. 计算移动平均线
     df_merged['c_ma10'] = df_merged['ratio_c'].rolling(window=10).mean()

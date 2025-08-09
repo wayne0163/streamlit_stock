@@ -206,7 +206,7 @@ def render_watchlist_editor(item_type='stock'):
 
 # --- Sidebar Navigation ---
 st.sidebar.title("导航")
-menu = ["数据管理", "自选列表管理", "资产管理", "选股策略", "行业指数对比", "回测引擎", "风险分析", "系统说明与操作指南"]
+menu = ["数据管理", "自选列表管理", "资产管理", "选股策略", "指数对比", "回测引擎", "风险分析", "系统说明与操作指南"]
 choice = st.sidebar.selectbox("功能导航", menu, key="main_menu")
 
 display_status()
@@ -338,9 +338,9 @@ elif choice == "选股策略":
             else:
                 st.info("根据最新数据，您的自选股中没有找到符合该策略条件的股票。" )
 
-elif choice == "行业指数对比":
-    st.header("行业指数对比分析")
-    st.info("本功能用于分析特定行业指数相对于市场基准指数的强弱走势。")
+elif choice == "指数对比":
+    st.header("指数对比分析")
+    st.info("本功能用于分析两个指数之间的相对强弱关系，通过计算每日收盘价比值来分析走势。")
 
     # 获取所有自选指数用于选择
     available_indices = db.fetch_all("SELECT ts_code, name FROM index_watchlist ORDER BY ts_code")
@@ -366,31 +366,65 @@ elif choice == "行业指数对比":
         base_selection = st.selectbox("选择基准指数 (如 全A指数)", options=index_options.keys(), index=default_base_index)
         base_index_code = index_options[base_selection]
     with col2:
-        industry_selection = st.selectbox("选择对比行业指数", options=index_options.keys(), index=default_industry_index)
-        industry_index_code = index_options[industry_selection]
+        comparison_selection = st.selectbox("选择对比指数", options=index_options.keys(), index=default_industry_index)
+        comparison_index_code = index_options[comparison_selection]
 
     date_range = st.date_input("选择分析时间周期", [date(2024, 1, 1), date.today()], key="comparison_date_range")
 
     if st.button("开始分析", type="primary"):
         if not date_range or len(date_range) != 2:
             st.error("请选择一个有效的日期范围。")
-        elif base_index_code == industry_index_code:
-            st.error("基准指数和行业指数不能相同。")
+        elif base_index_code == comparison_index_code:
+            st.error("基准指数和对比指数不能相同。")
         else:
             start_str, end_str = date_range[0].strftime('%Y%m%d'), date_range[1].strftime('%Y%m%d')
-            with st.spinner(f"正在计算 {industry_selection} 相对于 {base_selection} 的强度..."):
-                result_df = compare_indices(db, base_index_code, industry_index_code, start_str, end_str)
+            with st.spinner(f"正在计算 {comparison_selection} 相对于 {base_selection} 的比值..."):
+                result_df = compare_indices(db, base_index_code, comparison_index_code, start_str, end_str)
                 
                 if result_df is not None and not result_df.empty:
                     st.success("分析完成！")
                     
-                    # 绘制图表
+                    # 获取最新数据用于提示文字
+                    latest_date = result_df['date'].max()
+                    latest_ratio = result_df[result_df['date'] == latest_date]['ratio_c'].iloc[0]
+                    latest_ma10 = result_df[result_df['date'] == latest_date]['c_ma10'].iloc[0] if not pd.isna(result_df[result_df['date'] == latest_date]['c_ma10'].iloc[0]) else "N/A"
+                    latest_ma20 = result_df[result_df['date'] == latest_date]['c_ma20'].iloc[0] if not pd.isna(result_df[result_df['date'] == latest_date]['c_ma20'].iloc[0]) else "N/A"
+                    latest_ma60 = result_df[result_df['date'] == latest_date]['c_ma60'].iloc[0] if not pd.isna(result_df[result_df['date'] == latest_date]['c_ma60'].iloc[0]) else "N/A"
+                    
+                    # 添加大盘走势提示
+                    st.subheader("📊 大盘走势分析")
+                    
+                    # 获取沪深300最新数据
+                    hs300_query = """
+                    SELECT date, close FROM index_daily_price 
+                    WHERE ts_code = '000300.SH' AND date <= ? 
+                    ORDER BY date DESC LIMIT 1
+                    """
+                    hs300_latest = db.fetch_one(hs300_query, (end_str,))
+                    
+                    hs300_ma120_query = """
+                    SELECT AVG(close) as ma120 FROM index_daily_price 
+                    WHERE ts_code = '000300.SH' AND date <= ? 
+                    ORDER BY date DESC LIMIT 120
+                    """
+                    hs300_ma120 = db.fetch_one(hs300_ma120_query, (end_str,))
+                    
+                    if hs300_latest and hs300_ma120:
+                        st.info(f"**{latest_date.strftime('%Y年%m月%d日')}，沪深300指数收盘为{hs300_latest['close']:.2f}点，其120日均线点位为{hs300_ma120['ma120']:.2f}点，请自行判断大盘走势。**")
+                    
+                    st.subheader("📈 指数对比图表")
                     fig = px.line(result_df, x='date', y=['ratio_c', 'c_ma10', 'c_ma20', 'c_ma60'],
-                                  title=f'{industry_selection} vs {base_selection} 相对强度比率',
-                                  labels={'value': '比率', 'date': '日期', 'variable': '指标'})
+                                  title=f'{comparison_selection} vs {base_selection} 收盘价比值',
+                                  labels={'value': '比值', 'date': '日期', 'variable': '指标'})
                     fig.update_layout(legend_title_text='指标图例')
+                    fig.update_xaxes(
+                        tickformat="%Y-%m-%d",
+                        dtick="M1",
+                        ticklabelmode="period"
+                    )
                     st.plotly_chart(fig, use_container_width=True)
 
+                    st.subheader("📋 详细数据")
                     st.dataframe(result_df)
                 else:
                     st.error("分析失败。可能的原因是：在选定时间段内，一个或两个指数缺少数据，或者数据无法对齐。请检查您的数据。")
