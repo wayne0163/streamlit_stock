@@ -53,13 +53,14 @@ def compare_indices(db: Database, base_index_code: str, industry_index_code: str
     # 4. 直接计算收盘价比值 (行业指数 / 基准指数)
     df_merged['ratio_c'] = df_merged['close_industry'] / df_merged['close_base']
 
-    # 6. 计算移动平均线
+    # 5. 计算移动平均线
     df_merged['c_ma10'] = df_merged['ratio_c'].rolling(window=10).mean()
     df_merged['c_ma20'] = df_merged['ratio_c'].rolling(window=20).mean()
     df_merged['c_ma60'] = df_merged['ratio_c'].rolling(window=60).mean()
 
-    # 7. 返回结果
+    # 6. 整理结果数据
     result_df = df_merged[['ratio_c', 'c_ma10', 'c_ma20', 'c_ma60']].reset_index()
     result_df.rename(columns={'index': 'date'}, inplace=True)
-    
+
+    # 7. 返回结果
     return result_df
