@@ -6,7 +6,7 @@ from functools import lru_cache
 
 class Settings(BaseSettings):
     # 全局配置
-    PROJECT_NAME: str = "WaySsystem"
+    PROJECT_NAME: str = "streamlit-股票分析系统"
     VERSION: str = "0.1.0"
 
     # 数据源配置

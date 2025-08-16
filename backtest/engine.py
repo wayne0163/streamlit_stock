@@ -7,107 +7,198 @@ from strategies.manager import StrategyManager
 from config.settings import get_settings
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import logging
 
 settings = get_settings()
 
-def create_backtest_plot(results, ts_codes, strategy_name) -> go.Figure:
-    """使用Plotly创建交互式回测图表"""
+# --- 自定义资金管理器 (Custom Sizer) ---
+class RemainingCashSizer(bt.Sizer):
+    """
+    自定义Sizer，实现“剩余资金平均法”。
+    资金 = 剩余现金 / (最大持仓数 - 当前持仓数)
+    """
+    params = (('max_positions', 10),)
+
+    def __init__(self):
+        pass
+
+    def _getsizing(self, comminfo, cash, data, isbuy):
+        if isbuy:
+            # 计算当前已有的持仓数量
+            open_positions = 0
+            for d in self.strategy.datas:
+                pos = self.strategy.getposition(d)
+                if pos.size != 0:
+                    open_positions += 1
+            
+            # 如果持仓已满，则不再买入
+            if open_positions >= self.p.max_positions:
+                return 0
+
+            # 计算可用于本次交易的现金
+            spendable_slots = self.p.max_positions - open_positions
+            if spendable_slots <= 0: # 避免除以零
+                return 0
+            
+            cash_per_slot = self.broker.get_cash() / spendable_slots
+            
+            # 根据价格计算股数
+            size = cash_per_slot / data.close[0]
+            return int(size) # 返回整数股数
+        else:
+            # 如果是卖出操作，则卖出全部持仓
+            return self.strategy.getposition(data).size
+
+def create_backtest_plot(results, ts_codes, strategy_name, start_date: str, end_date: str, db: Database,
+                         initial_capital: float, normalized: bool = True) -> go.Figure:
+    """使用Plotly创建带有沪深300对比和回撤子图的回测图表。
+    - normalized=True 显示归一化净值；否则显示绝对净值（以初始资金为基准）。
+    """
     strat = results[0]
-    portfolio_values = pd.Series(strat.analyzers.timereturn.get_analysis())
+    # TimeReturn analyzer dict -> daily returns
+    ret_series = pd.Series(strat.analyzers.timereturn.get_analysis())
+    if ret_series.empty:
+        ret_series = pd.Series(dtype=float)
 
-    # 假设我们主要绘制第一个股票的K线图作为代表
-    main_code = ts_codes[0]
-    price_data = strat.getdatabyname(main_code)
-    
-    # 从 backtrader 的 line buffer 安全地提取数据
-    dates = [bt.num2date(x) for x in price_data.datetime.array]
-    df_price = pd.DataFrame({
-        'open': price_data.open.array,
-        'high': price_data.high.array,
-        'low': price_data.low.array,
-        'close': price_data.close.array,
-        'volume': price_data.volume.array,
-    }, index=pd.to_datetime(dates))
+    # 构建组合净值（归一化）
+    try:
+        port_curve = (1 + ret_series).cumprod()
+        port_curve.index = pd.to_datetime(port_curve.index)
+        # 若需要，仅从第一个交易日开始
+        first_valid = port_curve.first_valid_index()
+        if first_valid is not None:
+            port_curve = port_curve.loc[first_valid:]
+    except Exception:
+        port_curve = ret_series
 
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05,
-                        subplot_titles=(f'{main_code} Candlestick', 'Portfolio Value', 'Volume'),
-                        row_heights=[0.6, 0.2, 0.2])
+    # 获取沪深300
+    hs300_df = pd.DataFrame(db.fetch_all(
+        "SELECT date, close FROM index_daily_price WHERE ts_code = '000300.SH' AND date BETWEEN ? AND ? ORDER BY date",
+        (start_date, end_date)
+    ))
+    hs300_curve = None
+    if not hs300_df.empty:
+        hs300_df['date'] = pd.to_datetime(hs300_df['date'])
+        hs300_df.set_index('date', inplace=True)
+        hs300_curve = hs300_df['close'] / hs300_df['close'].iloc[0]
 
-    fig.add_trace(go.Candlestick(x=df_price.index, open=df_price['open'], high=df_price['high'],
-                                 low=df_price['low'], close=df_price['close'], name='Price'),
-                  row=1, col=1)
+    # 归一化或绝对净值转换
+    if not port_curve.empty:
+        if normalized:
+            strat_equity = port_curve
+        else:
+            strat_equity = port_curve * float(initial_capital)
+    else:
+        strat_equity = pd.Series(dtype=float)
 
-    # 提取并绘制交易点
-    trades = strat.analyzers.trade_analyzer.get_analysis()
-    buy_dates, sell_dates = [], []
-    if trades and trades.get('total', {}).get('total', 0) > 0:
-        for t in trades.values():
-            if isinstance(t, dict) and 'trades' in t:
-                for trade in t['trades']:
-                    if trade['pnl'] != 0: # 这是一个实际的交易
-                        trade_date = bt.num2date(trade['dtopen'])
-                        if trade['size'] > 0:
-                            buy_dates.append(trade_date)
-                        else:
-                            sell_dates.append(trade_date)
+    if hs300_curve is not None and not hs300_curve.empty:
+        if not normalized:
+            hs300_equity = hs300_curve * float(initial_capital)
+        else:
+            hs300_equity = hs300_curve
+        if not strat_equity.empty:
+            hs300_equity = hs300_equity.loc[strat_equity.index.min():]
+    else:
+        hs300_equity = None
 
-    # 确保交易日期在价格数据范围内
-    valid_buy_dates = [d for d in buy_dates if d in df_price.index]
-    valid_sell_dates = [d for d in sell_dates if d in df_price.index]
+    # 计算回撤
+    def drawdown(series: pd.Series) -> pd.Series:
+        if series is None or series.empty:
+            return pd.Series(dtype=float)
+        roll_max = series.cummax()
+        dd = series / roll_max - 1.0
+        return dd
 
-    if valid_buy_dates:
-        fig.add_trace(go.Scatter(x=valid_buy_dates, y=df_price.loc[valid_buy_dates, 'low'] * 0.98, mode='markers', name='Buy Signal',
-                                 marker=dict(symbol='triangle-up', color='green', size=10)),
-                      row=1, col=1)
-    if valid_sell_dates:
-        fig.add_trace(go.Scatter(x=valid_sell_dates, y=df_price.loc[valid_sell_dates, 'high'] * 1.02, mode='markers', name='Sell Signal',
-                                 marker=dict(symbol='triangle-down', color='red', size=10)),
-                      row=1, col=1)
+    strat_dd = drawdown(strat_equity)
+    hs300_dd = drawdown(hs300_equity) if hs300_equity is not None else pd.Series(dtype=float)
 
-    fig.add_trace(go.Scatter(x=portfolio_values.index, y=portfolio_values.values, name='Portfolio Value'),
-                  row=2, col=1)
+    # 子图：上净值，下回撤
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                        row_heights=[0.7, 0.3], subplot_titles=("净值曲线", "回撤"))
 
-    fig.add_trace(go.Bar(x=df_price.index, y=df_price['volume'], name='Volume'),
-                  row=3, col=1)
+    if not strat_equity.empty:
+        fig.add_trace(go.Scatter(x=strat_equity.index, y=strat_equity.values,
+                                 name='策略净值' + ('(归一)' if normalized else ''),
+                                 line=dict(color='royalblue', width=2)), row=1, col=1)
+    if hs300_equity is not None and not hs300_equity.empty:
+        fig.add_trace(go.Scatter(x=hs300_equity.index, y=hs300_equity.values,
+                                 name='沪深300' + ('(归一)' if normalized else ''),
+                                 line=dict(color='firebrick', width=1.5, dash='dash')), row=1, col=1)
 
-    fig.update_layout(height=800, title_text=f"Backtest Results for Strategy: {strategy_name}",
-                      xaxis_rangeslider_visible=False)
+    if not strat_dd.empty:
+        fig.add_trace(go.Scatter(x=strat_dd.index, y=strat_dd.values,
+                                 name='策略回撤', line=dict(color='royalblue', width=1)), row=2, col=1)
+    if not hs300_dd.empty:
+        fig.add_trace(go.Scatter(x=hs300_dd.index, y=hs300_dd.values,
+                                 name='沪深300回撤', line=dict(color='firebrick', width=1, dash='dash')), row=2, col=1)
+
+    fig.update_yaxes(title_text=('归一化净值' if normalized else '净值'), row=1, col=1)
+    fig.update_yaxes(title_text='回撤', tickformat='.0%', row=2, col=1)
+    fig.update_layout(
+        height=640,
+        title_text=f"Backtest: {strategy_name}（对比沪深300）",
+        xaxis_title="日期",
+        legend_title="图例",
+        template="plotly_white",
+        xaxis_tickformat='%Y-%m-%d'
+    )
     return fig
 
-def run_backtest(strategy_name: str, ts_codes: List[str], start_date: str, end_date: str, 
-                 initial_capital: float, max_positions: int) -> Dict[str, Any]:
+def run_backtest(strategy_name: str, ts_codes: List[str], start_date: str, end_date: str,
+                 initial_capital: float, max_positions: int, normalized: bool = True,
+                 strategy_params: dict | None = None) -> Dict[str, Any]:
     cerebro = bt.Cerebro()
     
     strategy_manager = StrategyManager(Database())
     strategy_class = strategy_manager.get_strategy_class(strategy_name)
     if not strategy_class:
         raise ValueError(f"策略 '{strategy_name}' 未找到")
-    cerebro.addstrategy(strategy_class)
+    
+    # 为策略传递参数：将 max_positions 传入，便于策略内限制当日新开仓数量
+    sp = strategy_params or {}
+    try:
+        cerebro.addstrategy(strategy_class, max_positions=max_positions, **sp)
+    except TypeError:
+        # 若策略不支持这些参数，回退只传 max_positions
+        cerebro.addstrategy(strategy_class, max_positions=max_positions)
 
     db = Database()
+    included_ts_codes = []
+    skipped_ts_codes = []
     for ts_code in ts_codes:
         query = "SELECT date, open, high, low, close, volume FROM daily_price WHERE ts_code = ? AND date BETWEEN ? AND ? ORDER BY date"
         df = pd.DataFrame(db.fetch_all(query, (ts_code, start_date, end_date)))
-        if not df.empty:
+        # 需要至少满足最长指标窗口（本策略最长为240天）
+        if not df.empty and len(df) > 240:
             df['date'] = pd.to_datetime(df['date'])
             df.set_index('date', inplace=True)
             data_feed = bt.feeds.PandasData(dataname=df)
             cerebro.adddata(data_feed, name=ts_code)
+            included_ts_codes.append(ts_code)
+        else:
+            skipped_ts_codes.append(ts_code)
 
+    # --- Broker, Sizer, and Slippage Configuration ---
     cerebro.broker.setcash(initial_capital)
+    # 设置手续费
     cerebro.broker.setcommission(commission=settings.BACKTEST_FEE_RATE)
-    sizers_perc = 95 / max_positions
-    cerebro.addsizer(bt.sizers.PercentSizer, percents=sizers_perc)
+    # 设置滑点 (0.01% = 0.0001)
+    cerebro.broker.set_slippage_perc(perc=0.0001)
+    
+    # 使用自定义的资金管理器
+    cerebro.addsizer(RemainingCashSizer, max_positions=max_positions)
 
+    # --- Analyzers ---
     cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe_ratio')
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
     cerebro.addanalyzer(bt.analyzers.Returns, _name='returns')
     cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trade_analyzer')
     cerebro.addanalyzer(bt.analyzers.TimeReturn, _name='timereturn')
 
-    print("--- 开始运行 Backtrader 回测 ---")
-    results = cerebro.run()
-    print("--- 回测结束 ---")
+    logging.getLogger(__name__).info("--- 开始运行 Backtrader 回测 ---")
+    # 使用 step-by-step 模式以规避 Python 3.13 下 backtrader runonce 的潜在兼容性问题
+    results = cerebro.run(runonce=False)
+    logging.getLogger(__name__).info("--- 回测结束 ---")
 
     thestrat = results[0]
     trade_analysis = thestrat.analyzers.trade_analyzer.get_analysis()
@@ -123,16 +214,64 @@ def run_backtest(strategy_name: str, ts_codes: List[str], start_date: str, end_d
     
     # 安全获取夏普比率
     sharpe_analysis = thestrat.analyzers.sharpe_ratio.get_analysis()
-    if sharpe_analysis is not None:
+    if sharpe_analysis and sharpe_analysis.get('sharperatio') is not None:
         metrics['sharpe_ratio'] = sharpe_analysis.get('sharperatio', 0)
     
     total_trades = trade_analysis.get('total', {}).get('total', 0)
     if total_trades > 0:
-        metrics['win_rate'] = (trade_analysis.get('won', {}).get('total', 0) / total_trades) * 100
+        won_trades = trade_analysis.get('won', {}).get('total', 0)
+        metrics['win_rate'] = (won_trades / total_trades) * 100 if total_trades > 0 else 0
 
-    plot_figure = create_backtest_plot(results, ts_codes, strategy_name)
+    # --- Save trades to CSV ---
+    trades_csv_path = None
+    orders_csv_path = None
+    if hasattr(thestrat, 'closed_trades') and thestrat.closed_trades:
+        import datetime
+
+        trades_df = pd.DataFrame(thestrat.closed_trades)
+        
+        # 格式化输出
+        trades_df['买卖方向'] = trades_df['direction'].apply(lambda x: '卖出(平多)' if x == 'long' else '买入(平空)')
+        
+        # 选择并重命名列
+        output_df = pd.DataFrame({
+            '交易时间': pd.to_datetime(trades_df['close_datetime']).dt.strftime('%Y-%m-%d %H:%M:%S'),
+            'ts_code': trades_df['ts_code'],
+            '开仓价格': trades_df['open_price'].round(2),
+            '数量': trades_df['size'],
+            '平仓方向': trades_df['买卖方向'],
+            '盈利': trades_df['profit_comm'].round(2)
+        })
+
+        timestamp = datetime.datetime.now().strftime('%Y%m%d%H%M')
+        os.makedirs('output', exist_ok=True)
+        filename = os.path.join('output', f'backtest_trades_{timestamp}.csv')
+        output_df.to_csv(filename, index=False, encoding='utf-8-sig')
+        trades_csv_path = filename
+        logging.getLogger(__name__).info(f"交易记录已保存至: {filename}")
+
+    # 导出订单执行明细（包含买入与卖出）
+    if hasattr(thestrat, 'executed_orders') and thestrat.executed_orders:
+        import datetime
+        orders_df = pd.DataFrame(thestrat.executed_orders).copy()
+        orders_df['时间'] = pd.to_datetime(orders_df['datetime']).dt.strftime('%Y-%m-%d %H:%M:%S')
+        orders_df['方向'] = orders_df['side'].map({'buy': '买入', 'sell': '卖出'})
+        orders_df = orders_df[['时间', 'ts_code', '方向', 'size', 'price', 'commission']]
+        timestamp = datetime.datetime.now().strftime('%Y%m%d%H%M')
+        filename = os.path.join('output', f'backtest_orders_{timestamp}.csv')
+        orders_df.to_csv(filename, index=False, encoding='utf-8-sig')
+        orders_csv_path = filename
+        logging.getLogger(__name__).info(f"订单执行记录已保存至: {filename}")
+
+    plot_figure = create_backtest_plot(results, ts_codes, strategy_name, start_date, end_date, db,
+                                       initial_capital=initial_capital, normalized=normalized)
 
     return {
         'metrics': metrics,
-        'plot_figure': plot_figure
+        'plot_figure': plot_figure,
+        'trades_csv': trades_csv_path,
+        'orders_csv': orders_csv_path,
+        'included_ts_codes': included_ts_codes,
+        'skipped_ts_codes': skipped_ts_codes,
+        'min_required_bars': 241
     }

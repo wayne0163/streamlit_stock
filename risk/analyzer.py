@@ -2,18 +2,9 @@ import pandas as pd
 import numpy as np
 from scipy.stats import norm
 from typing import List, Dict, Any
-from data.database import Database
 from portfolio.manager import PortfolioManager
 from config.settings import get_settings
-
-settings = get_settings()
-
-import pandas as pd
-import numpy as np
-from scipy.stats import norm
-from typing import List, Dict, Any
-from portfolio.manager import PortfolioManager
-from config.settings import get_settings
+import logging
 
 settings = get_settings()
 
@@ -40,26 +31,24 @@ class RiskAnalyzer:
         return abs(cvar) * 100 # 转换为百分比
 
     def get_portfolio_returns(self) -> pd.Series:
-        """
-        获取投资组合的日收益率.
-        注意: 这是一个简化的实现. 准确的实现需要每日的投资组合价值快照.
-        """
-        # 理想情况下，我们应该有一个 `portfolio_daily_value` 表
-        # 这里我们用一个简化的方法：基于交易记录来估算
+        """获取投资组合的日收益率（优先基于组合净值快照）。"""
+        # 优先使用快照
+        snapshots = self.pm.get_snapshots()
+        if snapshots is not None and not snapshots.empty:
+            total = snapshots['total_value']
+            returns = total.pct_change().dropna()
+            return returns
+
+        # 兜底：没有快照则使用粗略近似
         trade_history = self.pm.get_trade_history()
         if not trade_history:
             return pd.Series(dtype=float)
-
         df = pd.DataFrame(trade_history)
         df['date'] = pd.to_datetime(df['date'])
         df = df.set_index('date')
-        
-        # 这是一个非常粗略的估算，并未考虑每日价格波动
-        # 仅用于演示目的
         daily_pnl = df.apply(lambda row: row['qty'] * row['price'] if row['side'] == 'sell' else -row['qty'] * row['price'], axis=1)
-        daily_returns = daily_pnl / self.pm.cash # 同样是粗略估算
-        
-        return daily_returns
+        base = self.pm.cash if self.pm.cash and self.pm.cash != 0 else abs(daily_pnl).mean() or 1.0
+        return (daily_pnl / base)
 
     def analyze_portfolio_risk(self) -> Dict[str, Any]:
         """分析投资组合风险"""

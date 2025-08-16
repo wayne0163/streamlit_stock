@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import logging
 from typing import List, Dict, Any, Optional
 from config.settings import get_settings
 
@@ -13,7 +14,21 @@ class Database:
         # Connect to the database, allowing multi-threaded access for Streamlit
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self._configure_pragmas()
         self._create_tables()
+
+    def _configure_pragmas(self):
+        """Tune SQLite for better performance and concurrency."""
+        try:
+            cursor = self.conn.cursor()
+            # WAL improves concurrent reads/writes; NORMAL is a safe tradeoff
+            cursor.execute('PRAGMA journal_mode=WAL;')
+            cursor.execute('PRAGMA synchronous=NORMAL;')
+            cursor.execute('PRAGMA temp_store=MEMORY;')
+            cursor.execute('PRAGMA mmap_size=134217728;')  # 128MB
+            self.conn.commit()
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Failed to set PRAGMAs: {e}")
 
     def _create_tables(self):
         """Creates all necessary tables with the correct schema."""
@@ -134,6 +149,25 @@ class Database:
             PRIMARY KEY (portfolio_name, ts_code)
         )
         ''')
+
+        # Portfolio daily value snapshots for accurate risk metrics
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+            portfolio_name TEXT,
+            date TEXT,
+            total_value REAL,
+            cash REAL,
+            investment_value REAL,
+            PRIMARY KEY (portfolio_name, date)
+        )
+        ''')
+
+        # Indexes for performance
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_daily_price ON daily_price(ts_code, date)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_index_daily_price ON index_daily_price(ts_code, date)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_watchlist_ts ON watchlist(ts_code)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_index_watchlist_ts ON index_watchlist(ts_code)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots ON portfolio_snapshots(portfolio_name, date)')
 
         self.conn.commit()
 

@@ -9,6 +9,9 @@ __pycache__/
 
 # 忽略数据库文件
 *.db
+*.db-wal
+*.db-shm
+data/*.db*
 
 # 忽略输出目录
 output/
