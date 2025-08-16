@@ -17,7 +17,7 @@ data/*.db*
 output/
 
 # 忽略CSV文件
-*.csv
+
 
 # 忽略操作系统文件
 .DS_Store
